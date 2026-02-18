@@ -79,6 +79,19 @@ interface RecycleLinkView {
   quantity: number;
 }
 
+interface LoadoutEntry {
+  key: string;
+  familyKey: string;
+  variantId: string;
+  quantity: number;
+  mode: 'upgrade' | 'craft';
+}
+
+interface RequirementListEntry {
+  requirement: RequirementRow;
+  item?: PlannerItem;
+}
+
 type UiCategoryId =
   | 'augments'
   | 'shields'
@@ -112,6 +125,50 @@ const UI_CATEGORY_CONFIG: UiCategoryConfig[] = [
   { id: 'materials', label: 'Materials', iconUrl: '/stash-icons/icon-material.png' },
   { id: 'misc', label: 'Misc', iconUrl: '/stash-icons/icon-misc.png' },
 ];
+
+const loadedImageSources = new Set<string>();
+
+interface LazyTileImageProps {
+  src: string;
+  alt: string;
+  isWeapon?: boolean;
+}
+
+function LazyTileImage({ src, alt, isWeapon = false }: LazyTileImageProps) {
+  const [status, setStatus] = useState<'loading' | 'loaded' | 'error'>(() =>
+    loadedImageSources.has(src) ? 'loaded' : 'loading',
+  );
+
+  useEffect(() => {
+    setStatus(loadedImageSources.has(src) ? 'loaded' : 'loading');
+  }, [src]);
+
+  if (status === 'error') {
+    return <div className="tile-placeholder" aria-hidden />;
+  }
+
+  return (
+    <>
+      <div className={`tile-loading-overlay ${status === 'loaded' ? 'done' : ''}`} aria-hidden>
+        <span className="tile-spinner" />
+      </div>
+      <img
+        src={src}
+        alt={alt}
+        loading="lazy"
+        decoding="async"
+        onLoad={() => {
+          loadedImageSources.add(src);
+          setStatus('loaded');
+        }}
+        onError={() => setStatus('error')}
+        className={['lazy-image', status === 'loaded' ? 'is-loaded' : '', isWeapon ? 'weapon-icon' : '']
+          .filter(Boolean)
+          .join(' ')}
+      />
+    </>
+  );
+}
 
 function normalizeKey(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
@@ -183,7 +240,7 @@ function isBlueprintName(value: string | undefined): boolean {
 
 function categoryFromType(type: string | undefined): UiCategoryId | undefined {
   const normalized = normalizeKey(type ?? '');
-  if (normalized === 'cosmetic') {
+  if (normalized === 'cosmetic' || normalized === 'cosmetics' || normalized === 'misc') {
     return undefined;
   }
 
@@ -204,7 +261,7 @@ function categoryFromType(type: string | undefined): UiCategoryId | undefined {
   ) {
     return 'materials';
   }
-  if (normalized === 'trinket' || normalized === 'nature' || normalized === 'blueprint' || normalized === 'misc' || normalized === 'gadget') {
+  if (normalized === 'trinket' || normalized === 'nature' || normalized === 'blueprint' || normalized === 'gadget') {
     return 'misc';
   }
 
@@ -340,6 +397,22 @@ function toFamilies(items: PlannerItem[]): ItemFamily[] {
 
 function defaultVariantForFamily(family: ItemFamily): PlannerItem | undefined {
   return family.variants.find((variant) => variant.level === 1) ?? family.variants[0];
+}
+
+function thumbnailVariantForFamily(family: ItemFamily, category: UiCategoryId): PlannerItem | undefined {
+  if (category !== 'weapons') {
+    return defaultVariantForFamily(family) ?? family.variants[0];
+  }
+
+  const leveled = family.variants
+    .filter((variant): variant is PlannerItem & { level: number } => variant.level !== undefined)
+    .sort((left, right) => right.level - left.level);
+
+  if (leveled.length === 0) {
+    return defaultVariantForFamily(family) ?? family.variants[0];
+  }
+
+  return leveled.find((variant) => Boolean(variant.iconUrl)) ?? leveled[0];
 }
 
 function variantLabel(item: PlannerItem): string {
@@ -639,14 +712,14 @@ function scaleRequirementRows(requirements: RequirementRow[], multiplier: number
 
 export default function App() {
   const [data, setData] = useState<DiffDataResponse | null>(null);
+  const [activePage, setActivePage] = useState<'database' | 'planner'>('database');
+  const [search, setSearch] = useState('');
+  const [plannerSearch, setPlannerSearch] = useState('');
+  const [plannerRecycleScope, setPlannerRecycleScope] = useState<'materials' | 'withGear'>('materials');
   const [selectedFamilyKey, setSelectedFamilyKey] = useState<string | undefined>();
   const [selectedVariantId, setSelectedVariantId] = useState<string | undefined>();
-  const [search, setSearch] = useState('');
-  const [recycleScope, setRecycleScope] = useState<'materials' | 'withGear'>('materials');
-  const [directMode, setDirectMode] = useState<'upgrade' | 'craft'>('upgrade');
-  const [recycleLinksMode, setRecycleLinksMode] = useState<'from' | 'into'>('from');
-  const [selectedRecycleLinkKey, setSelectedRecycleLinkKey] = useState<string | undefined>();
-  const [focusSelection, setFocusSelection] = useState<FocusState | undefined>();
+  const [loadoutEntries, setLoadoutEntries] = useState<LoadoutEntry[]>([]);
+  const [dragOverDropzone, setDragOverDropzone] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -678,7 +751,20 @@ export default function App() {
     return new Map(plannerItems.map((item) => [item.id, item]));
   }, [plannerItems]);
 
+  const itemByName = useMemo(() => {
+    const map = new Map<string, PlannerItem[]>();
+    for (const item of plannerItems) {
+      const key = normalizeKey(item.name);
+      const list = map.get(key) ?? [];
+      list.push(item);
+      map.set(key, list);
+    }
+    return map;
+  }, [plannerItems]);
+
   const families = useMemo(() => toFamilies(plannerItems), [plannerItems]);
+  const familyByKey = useMemo(() => new Map(families.map((family) => [family.key, family])), [families]);
+  const recycleIndex = useMemo(() => buildRecycleIndex(plannerItems), [plannerItems]);
 
   const familyViews = useMemo<FamilyView[]>(() => {
     return families
@@ -694,6 +780,7 @@ export default function App() {
         if (!category) {
           return undefined;
         }
+        const thumbnailVariant = thumbnailVariantForFamily(family, category);
 
         return {
           family,
@@ -702,7 +789,7 @@ export default function App() {
           category,
           hasCraftData,
           hasRecycleData,
-          thumbnailIconUrl: primary?.iconUrl,
+          thumbnailIconUrl: thumbnailVariant?.iconUrl,
         };
       })
       .filter((view): view is FamilyView => Boolean(view));
@@ -712,32 +799,26 @@ export default function App() {
     if (!selectedFamilyKey) {
       return;
     }
-
     if (!families.some((family) => family.key === selectedFamilyKey)) {
       setSelectedFamilyKey(undefined);
       setSelectedVariantId(undefined);
     }
   }, [families, selectedFamilyKey]);
 
-  const filteredFamilyViews = useMemo(() => {
-    const normalizedSearch = normalizeKey(search);
-
-    return familyViews.filter((view) => {
+  const buildGroupedSections = useCallback((query: string) => {
+    const normalizedSearch = normalizeKey(query);
+    const filtered = familyViews.filter((view) => {
       if (!normalizedSearch) {
         return true;
       }
-
       if (normalizeKey(view.family.baseName).includes(normalizedSearch)) {
         return true;
       }
-
       return view.family.variants.some((variant) => normalizeKey(variant.name).includes(normalizedSearch));
     });
-  }, [familyViews, search]);
 
-  const groupedSections = useMemo(() => {
     const map = new Map<UiCategoryId, FamilyView[]>();
-    for (const view of filteredFamilyViews) {
+    for (const view of filtered) {
       const current = map.get(view.category) ?? [];
       current.push(view);
       map.set(view.category, current);
@@ -746,14 +827,17 @@ export default function App() {
     return UI_CATEGORY_CONFIG.map((config) => ({
       ...config,
       items: (map.get(config.id) ?? []).sort((a, b) => {
-          const rarityDiff = rarityRank(b.primaryRarity) - rarityRank(a.primaryRarity);
-          if (rarityDiff !== 0) {
-            return rarityDiff;
-          }
-          return a.family.baseName.localeCompare(b.family.baseName);
-        }),
+        const rarityDiff = rarityRank(b.primaryRarity) - rarityRank(a.primaryRarity);
+        if (rarityDiff !== 0) {
+          return rarityDiff;
+        }
+        return a.family.baseName.localeCompare(b.family.baseName);
+      }),
     })).filter((section) => section.items.length > 0);
-  }, [filteredFamilyViews]);
+  }, [familyViews]);
+
+  const groupedSections = useMemo(() => buildGroupedSections(search), [buildGroupedSections, search]);
+  const plannerGroupedSections = useMemo(() => buildGroupedSections(plannerSearch), [buildGroupedSections, plannerSearch]);
 
   const selectedFamily = useMemo(() => {
     if (!selectedFamilyKey) {
@@ -783,157 +867,10 @@ export default function App() {
       }
       return;
     }
-
     if (!selectedVariantId || !selectedFamily.variants.some((variant) => variant.id === selectedVariantId)) {
       setSelectedVariantId(defaultVariantForFamily(selectedFamily)?.id);
     }
   }, [selectedFamily, selectedVariantId]);
-
-  useEffect(() => {
-    setFocusSelection(undefined);
-    setSelectedRecycleLinkKey(undefined);
-    setRecycleLinksMode('from');
-  }, [selectedVariantId]);
-
-  const recycleIndex = useMemo(() => buildRecycleIndex(plannerItems), [plannerItems]);
-
-  const itemByName = useMemo(() => {
-    const map = new Map<string, PlannerItem[]>();
-    for (const item of plannerItems) {
-      const key = normalizeKey(item.name);
-      const list = map.get(key) ?? [];
-      list.push(item);
-      map.set(key, list);
-    }
-    return map;
-  }, [plannerItems]);
-
-  const selectedRecycleIntoViews = useMemo<RecycleLinkView[]>(() => {
-    const entries = selectedVariant?.raw?.recycle_components;
-    if (!Array.isArray(entries)) {
-      return [];
-    }
-
-    const totals = new Map<string, RecycleLinkView>();
-    for (const entry of entries) {
-      if (!entry || typeof entry !== 'object') {
-        continue;
-      }
-      const row = entry as Record<string, unknown>;
-      const nested = row.component && typeof row.component === 'object' ? (row.component as Record<string, unknown>) : undefined;
-      const nestedId = typeof nested?.id === 'string' ? nested.id.toLowerCase() : undefined;
-      const nestedName = typeof nested?.name === 'string' ? nested.name : nestedId;
-      if (!nestedId && !nestedName) {
-        continue;
-      }
-
-      const key = nestedId ?? `name:${normalizeKey(nestedName ?? 'unknown')}`;
-      const quantity = numberFromUnknown(row.quantity) ?? numberFromUnknown(row.amount) ?? numberFromUnknown(row.count) ?? 1;
-      const linkedItem = nestedId ? itemById.get(nestedId) : itemByName.get(normalizeKey(nestedName ?? ''))?.[0];
-
-      const iconUrlRaw = typeof nested?.icon === 'string' ? proxyIconUrl(nested.icon) : linkedItem?.iconUrl;
-      const name = nestedName ?? linkedItem?.name ?? 'Unknown';
-      const type = (typeof nested?.item_type === 'string' ? nested.item_type : undefined) ?? linkedItem?.type;
-      const rarity = (typeof nested?.rarity === 'string' ? nested.rarity : undefined) ?? linkedItem?.rarity;
-
-      const existing = totals.get(key);
-      if (existing) {
-        existing.quantity += quantity;
-      } else {
-        totals.set(key, {
-          key,
-          itemId: nestedId,
-          name,
-          type,
-          rarity,
-          iconUrl: iconUrlRaw,
-          quantity,
-        });
-      }
-    }
-
-    return Array.from(totals.values()).sort((left, right) => {
-      if (left.quantity !== right.quantity) {
-        return right.quantity - left.quantity;
-      }
-      return left.name.localeCompare(right.name);
-    });
-  }, [selectedVariant, itemById, itemByName]);
-
-  const selectedRecycleFromViews = useMemo<RecycleLinkView[]>(() => {
-    const entries = selectedVariant?.raw?.recycle_from;
-    if (!Array.isArray(entries)) {
-      return [];
-    }
-
-    const totals = new Map<string, RecycleLinkView>();
-    for (const entry of entries) {
-      if (!entry || typeof entry !== 'object') {
-        continue;
-      }
-      const row = entry as Record<string, unknown>;
-      const nested = row.item && typeof row.item === 'object' ? (row.item as Record<string, unknown>) : undefined;
-      const nestedId = typeof nested?.id === 'string' ? nested.id.toLowerCase() : undefined;
-      const nestedName = typeof nested?.name === 'string' ? nested.name : nestedId;
-      if (!nestedId && !nestedName) {
-        continue;
-      }
-
-      const key = nestedId ?? `name:${normalizeKey(nestedName ?? 'unknown')}`;
-      const quantity = numberFromUnknown(row.quantity) ?? numberFromUnknown(row.amount) ?? numberFromUnknown(row.count) ?? 1;
-      const linkedItem = nestedId ? itemById.get(nestedId) : itemByName.get(normalizeKey(nestedName ?? ''))?.[0];
-
-      const iconUrlRaw = typeof nested?.icon === 'string' ? proxyIconUrl(nested.icon) : linkedItem?.iconUrl;
-      const name = nestedName ?? linkedItem?.name ?? 'Unknown';
-      const type = (typeof nested?.item_type === 'string' ? nested.item_type : undefined) ?? linkedItem?.type;
-      const rarity = (typeof nested?.rarity === 'string' ? nested.rarity : undefined) ?? linkedItem?.rarity;
-
-      const existing = totals.get(key);
-      if (existing) {
-        existing.quantity += quantity;
-      } else {
-        totals.set(key, {
-          key,
-          itemId: nestedId,
-          name,
-          type,
-          rarity,
-          iconUrl: iconUrlRaw,
-          quantity,
-        });
-      }
-    }
-
-    return Array.from(totals.values()).sort((left, right) => {
-      if (left.quantity !== right.quantity) {
-        return right.quantity - left.quantity;
-      }
-      return left.name.localeCompare(right.name);
-    });
-  }, [selectedVariant, itemById, itemByName]);
-
-  const hasRecycleInto = selectedRecycleIntoViews.length > 0;
-  const hasRecycleFrom = selectedRecycleFromViews.length > 0;
-  const activeRecycleLinks = recycleLinksMode === 'from' ? selectedRecycleFromViews : selectedRecycleIntoViews;
-
-  useEffect(() => {
-    if (hasRecycleFrom) {
-      return;
-    }
-    if (hasRecycleInto) {
-      setRecycleLinksMode('into');
-      return;
-    }
-  }, [hasRecycleFrom, hasRecycleInto]);
-
-  useEffect(() => {
-    if (!selectedRecycleLinkKey) {
-      return;
-    }
-    if (!activeRecycleLinks.some((entry) => entry.key === selectedRecycleLinkKey)) {
-      setSelectedRecycleLinkKey(undefined);
-    }
-  }, [activeRecycleLinks, selectedRecycleLinkKey]);
 
   const isBlueprintPart = useCallback(
     (part: RecipePart): boolean => {
@@ -941,137 +878,206 @@ export default function App() {
       if (byId) {
         return isBlueprintType(byId.type) || isBlueprintName(byId.name);
       }
-
       const byName = part.name ? itemByName.get(normalizeKey(part.name))?.[0] : undefined;
       if (byName) {
         return isBlueprintType(byName.type) || isBlueprintName(byName.name);
       }
-
       return isBlueprintName(part.name);
     },
     [itemById, itemByName],
   );
 
-  const directRequirements = useMemo(() => {
-    if (!selectedVariant) {
-      return [];
+  const closeDbPanel = useCallback(() => {
+    setSelectedFamilyKey(undefined);
+    setSelectedVariantId(undefined);
+  }, []);
+
+  useEffect(() => {
+    if (!selectedFamily || activePage !== 'database') {
+      return;
     }
-    if (directMode === 'upgrade') {
-      return toRequirementRows(selectedVariant.inputs.filter((input) => !isBlueprintPart(input)));
-    }
-
-    return toRequirementRows(computeUpgradeCraftParts(selectedFamily, selectedVariant, itemById, isBlueprintPart));
-  }, [directMode, selectedFamily, selectedVariant, itemById, isBlueprintPart]);
-
-  const toRequirementViews = useCallback(
-    (requirements: RequirementRow[]): RequirementView[] =>
-      requirements.map((requirement) => {
-        const bucketKey = requirement.itemId ? requirement.itemId.toLowerCase() : `name:${normalizeKey(requirement.name)}`;
-        const candidates = recycleIndex.get(bucketKey) ?? [];
-        const scopedCandidates = recycleScope === 'materials' ? candidates.filter((candidate) => candidate.isMaterialLike) : candidates;
-        const topCandidates = scopedCandidates
-          .map((candidate) => ({
-            ...candidate,
-            recycleCount: Math.ceil(requirement.amount / candidate.yield),
-          }))
-          .sort((left, right) => {
-            if (left.recycleCount !== right.recycleCount) {
-              return left.recycleCount - right.recycleCount;
-            }
-            if (left.yield !== right.yield) {
-              return right.yield - left.yield;
-            }
-            return left.itemName.localeCompare(right.itemName);
-          })
-          .slice(0, 4);
-
-        const requirementItem =
-          (requirement.itemId ? itemById.get(requirement.itemId.toLowerCase()) : undefined) ??
-          itemByName.get(normalizeKey(requirement.name))?.[0];
-
-        return {
-          requirement,
-          requirementItem,
-          topCandidates,
-        };
-      }),
-    [recycleIndex, recycleScope, itemById, itemByName],
-  );
-
-  const directRequirementViews = useMemo<RequirementView[]>(() => {
-    return toRequirementViews(directRequirements);
-  }, [toRequirementViews, directRequirements]);
-
-  const directChainViews = useMemo(() => {
-    return directRequirementViews.map((entry) => {
-      const rows: RequirementRow[] = [];
-      if (entry.requirementItem) {
-        const expanded = computeExpandedRequirements(entry.requirementItem, itemById, isBlueprintPart);
-        const scaled = scaleRequirementRows(expanded, entry.requirement.amount);
-        if (scaled.length > 0) {
-          rows.push(...scaled);
-        } else {
-          rows.push(entry.requirement);
-        }
-      } else {
-        rows.push(entry.requirement);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closeDbPanel();
       }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [selectedFamily, activePage, closeDbPanel]);
 
-      const views = toRequirementViews(rows);
-      return {
-        directKey: entry.requirement.key,
-        views,
-        materialKeys: new Set(views.map((view) => view.requirement.key)),
-        recyclerIds: new Set(views.flatMap((view) => view.topCandidates.map((candidate) => candidate.itemId))),
-      };
+  const onSelectFamily = useCallback((family: ItemFamily) => {
+    if (selectedFamilyKey === family.key) {
+      closeDbPanel();
+      return;
+    }
+    setSelectedFamilyKey(family.key);
+    setSelectedVariantId(defaultVariantForFamily(family)?.id);
+  }, [selectedFamilyKey, closeDbPanel]);
+
+  useEffect(() => {
+    setLoadoutEntries((previous) => {
+      const next = previous.filter((entry) => {
+        const family = familyByKey.get(entry.familyKey);
+        if (!family) {
+          return false;
+        }
+        return family.variants.some((variant) => variant.id === entry.variantId);
+      });
+      return next.length === previous.length ? previous : next;
     });
-  }, [directRequirementViews, itemById, toRequirementViews, isBlueprintPart]);
+  }, [familyByKey]);
 
-  const drilledRequirements = useMemo<RequirementRow[]>(() => {
-    const totals = new Map<string, RequirementRow>();
-    for (const chain of directChainViews) {
-      for (const view of chain.views) {
-        const existing = totals.get(view.requirement.key);
-        if (existing) {
-          existing.amount += view.requirement.amount;
-          continue;
-        }
-        totals.set(view.requirement.key, { ...view.requirement });
-      }
+  const addFamilyToLoadout = useCallback((familyKey: string) => {
+    const family = familyByKey.get(familyKey);
+    if (!family) {
+      return;
+    }
+    const variant = defaultVariantForFamily(family) ?? family.variants[0];
+    if (!variant) {
+      return;
     }
 
+    setLoadoutEntries((previous) => {
+      const existing = previous.find((entry) => entry.variantId === variant.id && entry.mode === 'craft');
+      if (existing) {
+        return previous.map((entry) =>
+          entry.key === existing.key ? { ...entry, quantity: entry.quantity + 1 } : entry,
+        );
+      }
+      return [
+        ...previous,
+        {
+          key: `${family.key}:${variant.id}:${Date.now()}`,
+          familyKey: family.key,
+          variantId: variant.id,
+          quantity: 1,
+          mode: 'craft',
+        },
+      ];
+    });
+  }, [familyByKey]);
+
+  const resolvedLoadout = useMemo(() => {
+    return loadoutEntries
+      .map((entry) => {
+        const family = familyByKey.get(entry.familyKey);
+        if (!family) {
+          return undefined;
+        }
+        const variant = family.variants.find((item) => item.id === entry.variantId) ?? defaultVariantForFamily(family) ?? family.variants[0];
+        if (!variant) {
+          return undefined;
+        }
+        return { entry, family, variant };
+      })
+      .filter((row): row is { entry: LoadoutEntry; family: ItemFamily; variant: PlannerItem } => Boolean(row));
+  }, [loadoutEntries, familyByKey]);
+
+  const mergeRows = useCallback((rows: RequirementRow[]): RequirementRow[] => {
+    const totals = new Map<string, RequirementRow>();
+    for (const row of rows) {
+      const existing = totals.get(row.key);
+      if (existing) {
+        existing.amount += row.amount;
+        continue;
+      }
+      totals.set(row.key, { ...row });
+    }
     return Array.from(totals.values()).sort((left, right) => {
       if (left.amount !== right.amount) {
         return right.amount - left.amount;
       }
       return left.name.localeCompare(right.name);
     });
-  }, [directChainViews]);
+  }, []);
 
-  const drilledRequirementViews = useMemo<RequirementView[]>(() => toRequirementViews(drilledRequirements), [toRequirementViews, drilledRequirements]);
+  const directTotals = useMemo<RequirementRow[]>(() => {
+    const allRows: RequirementRow[] = [];
 
-  const allRecycleViews = useMemo<RecycleAggregateView[]>(() => {
+    for (const row of resolvedLoadout) {
+      const parts =
+        row.entry.mode === 'upgrade'
+          ? row.variant.inputs.filter((input) => !isBlueprintPart(input))
+          : computeUpgradeCraftParts(row.family, row.variant, itemById, isBlueprintPart);
+      const direct = toRequirementRows(parts);
+      allRows.push(...scaleRequirementRows(direct, row.entry.quantity));
+    }
+
+    return mergeRows(allRows);
+  }, [resolvedLoadout, isBlueprintPart, itemById, mergeRows]);
+
+  const baseTotals = useMemo<RequirementRow[]>(() => {
+    const allRows: RequirementRow[] = [];
+
+    for (const requirement of directTotals) {
+      const requirementItem =
+        (requirement.itemId ? itemById.get(requirement.itemId.toLowerCase()) : undefined) ??
+        itemByName.get(normalizeKey(requirement.name))?.[0];
+
+      if (!requirementItem) {
+        allRows.push(requirement);
+        continue;
+      }
+
+      const expanded = computeExpandedRequirements(requirementItem, itemById, isBlueprintPart);
+      if (expanded.length === 0) {
+        allRows.push(requirement);
+        continue;
+      }
+
+      allRows.push(...scaleRequirementRows(expanded, requirement.amount));
+    }
+
+    return mergeRows(allRows);
+  }, [directTotals, itemById, itemByName, isBlueprintPart, mergeRows]);
+
+  const directTotalViews = useMemo<RequirementListEntry[]>(() => {
+    return directTotals.map((requirement) => ({
+      requirement,
+      item:
+        (requirement.itemId ? itemById.get(requirement.itemId.toLowerCase()) : undefined) ??
+        itemByName.get(normalizeKey(requirement.name))?.[0],
+    }));
+  }, [directTotals, itemById, itemByName]);
+
+  const baseTotalViews = useMemo<RequirementListEntry[]>(() => {
+    return baseTotals.map((requirement) => ({
+      requirement,
+      item:
+        (requirement.itemId ? itemById.get(requirement.itemId.toLowerCase()) : undefined) ??
+        itemByName.get(normalizeKey(requirement.name))?.[0],
+    }));
+  }, [baseTotals, itemById, itemByName]);
+
+  const recyclerPlan = useMemo<RecycleAggregateView[]>(() => {
     const totals = new Map<string, RecycleAggregateView>();
 
-    for (const entry of drilledRequirementViews) {
-      for (const candidate of entry.topCandidates) {
-        const existing = totals.get(candidate.itemId);
-        if (existing) {
-          existing.recycleCount += candidate.recycleCount;
-          if (!existing.covers.includes(entry.requirement.name)) {
-            existing.covers.push(entry.requirement.name);
-          }
-          continue;
-        }
-
-        totals.set(candidate.itemId, {
-          itemId: candidate.itemId,
-          itemName: candidate.itemName,
-          itemType: candidate.itemType,
-          recycleCount: candidate.recycleCount,
-          covers: [entry.requirement.name],
-        });
+    for (const requirement of baseTotals) {
+      const bucketKey = requirement.itemId ? requirement.itemId.toLowerCase() : `name:${normalizeKey(requirement.name)}`;
+      const candidates = recycleIndex.get(bucketKey) ?? [];
+      const scoped = plannerRecycleScope === 'materials' ? candidates.filter((candidate) => candidate.isMaterialLike) : candidates;
+      const best = scoped[0];
+      if (!best) {
+        continue;
       }
+
+      const recycleCount = Math.ceil(requirement.amount / best.yield);
+      const existing = totals.get(best.itemId);
+      if (existing) {
+        existing.recycleCount += recycleCount;
+        if (!existing.covers.includes(requirement.name)) {
+          existing.covers.push(requirement.name);
+        }
+        continue;
+      }
+
+      totals.set(best.itemId, {
+        itemId: best.itemId,
+        itemName: best.itemName,
+        itemType: best.itemType,
+        recycleCount,
+        covers: [requirement.name],
+      });
     }
 
     return Array.from(totals.values()).sort((left, right) => {
@@ -1080,135 +1086,20 @@ export default function App() {
       }
       return left.itemName.localeCompare(right.itemName);
     });
-  }, [drilledRequirementViews]);
+  }, [baseTotals, recycleIndex, plannerRecycleScope]);
 
-  const focusedDirectKeys = useMemo(() => {
-    if (!focusSelection) {
-      return undefined;
-    }
-
-    if (focusSelection.kind === 'direct') {
-      return new Set<string>([focusSelection.key]);
-    }
-
-    if (focusSelection.kind === 'material') {
-      const matches = directChainViews
-        .filter((chain) => chain.materialKeys.has(focusSelection.key))
-        .map((chain) => chain.directKey);
-      return new Set<string>(matches);
-    }
-
-    const matches = directChainViews
-      .filter((chain) => chain.recyclerIds.has(focusSelection.key))
-      .map((chain) => chain.directKey);
-    return new Set<string>(matches);
-  }, [focusSelection, directChainViews]);
-
-  const focusedMaterialKeys = useMemo(() => {
-    if (!focusSelection) {
-      return undefined;
-    }
-
-    const keys = new Set<string>();
-    for (const chain of directChainViews) {
-      if (!focusedDirectKeys?.has(chain.directKey)) {
-        continue;
-      }
-      for (const materialKey of chain.materialKeys) {
-        keys.add(materialKey);
-      }
-    }
-    return keys;
-  }, [focusSelection, directChainViews, focusedDirectKeys]);
-
-  const focusedRecyclerIds = useMemo(() => {
-    if (!focusSelection) {
-      return undefined;
-    }
-
-    const ids = new Set<string>();
-    for (const chain of directChainViews) {
-      if (!focusedDirectKeys?.has(chain.directKey)) {
-        continue;
-      }
-      for (const recyclerId of chain.recyclerIds) {
-        ids.add(recyclerId);
-      }
-    }
-    return ids;
-  }, [focusSelection, directChainViews, focusedDirectKeys]);
-
-  const hasFocus = Boolean(focusSelection);
-
-  useEffect(() => {
-    if (!focusSelection) {
+  const applyDropFamily = useCallback((event: React.DragEvent<HTMLElement>) => {
+    event.preventDefault();
+    setDragOverDropzone(false);
+    const familyKey = event.dataTransfer.getData('application/x-arc-family-key') || event.dataTransfer.getData('text/plain');
+    if (!familyKey) {
       return;
     }
-
-    if (focusSelection.kind === 'direct') {
-      if (!directRequirementViews.some((entry) => entry.requirement.key === focusSelection.key)) {
-        setFocusSelection(undefined);
-      }
-      return;
-    }
-
-    if (focusSelection.kind === 'material') {
-      if (!drilledRequirementViews.some((entry) => entry.requirement.key === focusSelection.key)) {
-        setFocusSelection(undefined);
-      }
-      return;
-    }
-
-    if (!allRecycleViews.some((entry) => entry.itemId === focusSelection.key)) {
-      setFocusSelection(undefined);
-    }
-  }, [focusSelection, directRequirementViews, drilledRequirementViews, allRecycleViews]);
-
-  const toggleFocus = useCallback((kind: FocusState['kind'], key: string) => {
-    setFocusSelection((previous) => {
-      if (previous?.kind === kind && previous.key === key) {
-        return undefined;
-      }
-      return { kind, key };
-    });
-  }, []);
-
-  const closePanel = useCallback(() => {
-    setSelectedFamilyKey(undefined);
-    setSelectedVariantId(undefined);
-    setFocusSelection(undefined);
-    setSelectedRecycleLinkKey(undefined);
-  }, []);
-
-  useEffect(() => {
-    if (!selectedFamily) {
-      return;
-    }
-
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        closePanel();
-      }
-    };
-
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [selectedFamily, closePanel]);
-
-  const onSelectFamily = (family: ItemFamily) => {
-    if (selectedFamilyKey === family.key) {
-      closePanel();
-      return;
-    }
-
-    setFocusSelection(undefined);
-    setSelectedRecycleLinkKey(undefined);
-    setSelectedFamilyKey(family.key);
-    setSelectedVariantId(defaultVariantForFamily(family)?.id);
-  };
+    addFamilyToLoadout(familyKey);
+  }, [addFamilyToLoadout]);
 
   return (
-    <div className={`app-root ${selectedFamily ? 'panel-open' : ''}`}>
+    <div className={`app-root ${activePage === 'database' && selectedFamily ? 'panel-open' : ''}`}>
       <header className="header-shell">
         <div className="header-top">
           <div className="arc-logo-block" aria-hidden>
@@ -1216,356 +1107,477 @@ export default function App() {
           </div>
           <div className="header-title-wrap">
             <div className="header-title">ARC Data Explorer</div>
-            <div className="header-subtitle">Dense thumbnail grid with fast filtering and drill-down</div>
+            <div className="header-subtitle">
+              {activePage === 'database' ? 'Browse item database' : 'Build loadouts and aggregate craft requirements'}
+            </div>
           </div>
+        </div>
+        <div className="header-row view-tabs" role="tablist" aria-label="App pages">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activePage === 'database'}
+            className={`view-tab ${activePage === 'database' ? 'active' : ''}`}
+            onClick={() => setActivePage('database')}
+          >
+            Database
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activePage === 'planner'}
+            className={`view-tab ${activePage === 'planner' ? 'active' : ''}`}
+            onClick={() => setActivePage('planner')}
+          >
+            Planner
+          </button>
         </div>
         <div className="header-row">
           <input
             className="search-input"
             type="text"
-            value={search}
-            placeholder="Type to filter squares..."
-            onChange={(event) => setSearch(event.target.value)}
+            value={activePage === 'database' ? search : plannerSearch}
+            placeholder={activePage === 'database' ? 'Type to filter squares...' : 'Filter planner library...'}
+            onChange={(event) => {
+              if (activePage === 'database') {
+                setSearch(event.target.value);
+              } else {
+                setPlannerSearch(event.target.value);
+              }
+            }}
           />
         </div>
         <div className="header-meta">
-          {loading ? 'Loading...' : 'Ready'} | Families: {filteredFamilyViews.length} / {familyViews.length}
+          {loading ? 'Loading...' : 'Ready'} | Families: {familyViews.length}
+          {activePage === 'planner' ? ` | Loadout items: ${resolvedLoadout.length}` : ''}
           {data ? ` | Updated: ${new Date(data.generatedAt).toLocaleString()}` : ''}
         </div>
       </header>
 
       {error ? <div className="error-box">{error}</div> : null}
 
-      <div className="main-layout">
-        <div className="grid-shell">
-          {groupedSections.map((section) => (
-            <section key={section.id} className="category-block">
-              <div className="category-head">
-                <span className="category-head-main">
-                  <img className="category-head-icon" src={section.iconUrl} alt="" aria-hidden />
-                  <span>{section.label}</span>
-                </span>
-                <span>{section.items.length}</span>
-              </div>
-              <div className="square-grid">
-                {section.items.map((view) => {
-                  const isSelected = selectedFamily?.key === view.family.key;
-                  const tileClasses = ['item-tile', tileClassForItem(view.primaryType, view.primaryRarity), isSelected ? 'selected' : '']
-                    .filter(Boolean)
-                    .join(' ');
-                  return (
+      {activePage === 'database' ? (
+        <>
+          <div className="main-layout">
+            <div className="grid-shell">
+              {groupedSections.map((section) => (
+                <section key={section.id} className="category-block">
+                  <div className="category-head">
+                    <span className="category-head-main">
+                      <img className="category-head-icon" src={section.iconUrl} alt="" aria-hidden />
+                      <span>{section.label}</span>
+                    </span>
+                    <span>{section.items.length}</span>
+                  </div>
+                  <div className="square-grid">
+                    {section.items.map((view) => {
+                      const isSelected = selectedFamily?.key === view.family.key;
+                      const tileClasses = ['item-tile', tileClassForItem(view.primaryType, view.primaryRarity), isSelected ? 'selected' : '']
+                        .filter(Boolean)
+                        .join(' ');
+                      return (
+                        <button
+                          key={view.family.key}
+                          type="button"
+                          className={tileClasses}
+                          onClick={() => onSelectFamily(view.family)}
+                          title={view.family.baseName}
+                          aria-label={view.family.baseName}
+                        >
+                          <div className="item-thumb">
+                            {view.thumbnailIconUrl ? (
+                              <LazyTileImage
+                                src={view.thumbnailIconUrl}
+                                alt={view.family.baseName}
+                                isWeapon={isWeaponType(view.primaryType)}
+                              />
+                            ) : (
+                              <div className="tile-placeholder" aria-hidden />
+                            )}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </section>
+              ))}
+              {groupedSections.length === 0 ? <div className="empty-grid">No families match filters.</div> : null}
+            </div>
+          </div>
+
+          {selectedFamily ? <button type="button" className="panel-backdrop" onClick={closeDbPanel} aria-label="Close details" /> : null}
+
+          <aside className={`side-panel ${selectedFamily ? 'open' : ''}`} aria-hidden={!selectedFamily}>
+            {selectedFamily ? (
+              <>
+                <div className="panel-head">
+                  <div className="panel-title">{selectedFamily.baseName}</div>
+                  <button type="button" className="panel-close-minimal" onClick={closeDbPanel} aria-label="Close details">
+                    ×
+                  </button>
+                </div>
+
+                {showLevelSelector ? (
+                  <div className="square-row">
+                    {selectedFamily.variants.map((variant) => (
+                      <button
+                        key={variant.id}
+                        type="button"
+                        className={`mini-square ${variant.id === selectedVariant?.id ? 'selected' : ''}`}
+                        onClick={() => setSelectedVariantId(variant.id)}
+                      >
+                        {variantLabel(variant)}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+
+                {selectedVariant ? (
+                  <div className="panel-section">
+                    <div className="section-head">Item Info</div>
+                    <div className="info-chip-row">
+                      {selectedVariant.type ? (
+                        <div className="info-chip">
+                          <span className="info-chip-label">Type</span>
+                          <span className="info-chip-value">{selectedVariant.type}</span>
+                        </div>
+                      ) : null}
+                      {selectedVariant.rarity ? (
+                        <div className="info-chip">
+                          <span className="info-chip-label">Rarity</span>
+                          <span className="info-chip-value">{selectedVariant.rarity}</span>
+                        </div>
+                      ) : null}
+                      {selectedVariant.value !== undefined ? (
+                        <div className="info-chip">
+                          <span className="info-chip-label">Value</span>
+                          <span className="info-chip-value">{formatAmount(selectedVariant.value)}</span>
+                        </div>
+                      ) : null}
+                      {selectedVariant.weight !== undefined ? (
+                        <div className="info-chip">
+                          <span className="info-chip-label">Weight</span>
+                          <span className="info-chip-value">{formatAmount(selectedVariant.weight)}</span>
+                        </div>
+                      ) : null}
+                      <div className="info-chip">
+                        <span className="info-chip-label">Direct Inputs</span>
+                        <span className="info-chip-value">{selectedVariant.inputs.length}</span>
+                      </div>
+                      <div className="info-chip">
+                        <span className="info-chip-label">Recycle Outputs</span>
+                        <span className="info-chip-value">{recycleParts(selectedVariant).length}</span>
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
+              </>
+            ) : null}
+          </aside>
+        </>
+      ) : (
+        <div className="planner-layout">
+          <div className="planner-library">
+            {plannerGroupedSections.map((section) => (
+              <section key={`planner-${section.id}`} className="category-block planner-category-block">
+                <div className="category-head">
+                  <span className="category-head-main">
+                    <img className="category-head-icon" src={section.iconUrl} alt="" aria-hidden />
+                    <span>{section.label}</span>
+                  </span>
+                  <span>{section.items.length}</span>
+                </div>
+                <div className="square-grid">
+                  {section.items.map((view) => (
                     <button
-                      key={view.family.key}
+                      key={`planner-item-${view.family.key}`}
                       type="button"
-                      className={tileClasses}
-                      onClick={() => onSelectFamily(view.family)}
-                      title={view.family.baseName}
-                      aria-label={view.family.baseName}
+                      className={['item-tile', tileClassForItem(view.primaryType, view.primaryRarity)].join(' ')}
+                      draggable
+                      onDragStart={(event) => {
+                        event.dataTransfer.setData('application/x-arc-family-key', view.family.key);
+                        event.dataTransfer.setData('text/plain', view.family.key);
+                        event.dataTransfer.effectAllowed = 'copy';
+                      }}
+                      onClick={() => addFamilyToLoadout(view.family.key)}
+                      title={`Add ${view.family.baseName} to loadout`}
+                      aria-label={`Add ${view.family.baseName} to loadout`}
                     >
                       <div className="item-thumb">
                         {view.thumbnailIconUrl ? (
-                          <img
+                          <LazyTileImage
                             src={view.thumbnailIconUrl}
                             alt={view.family.baseName}
-                            loading="lazy"
-                            className={isWeaponType(view.primaryType) ? 'weapon-icon' : undefined}
+                            isWeapon={isWeaponType(view.primaryType)}
                           />
                         ) : (
                           <div className="tile-placeholder" aria-hidden />
                         )}
                       </div>
                     </button>
+                  ))}
+                </div>
+              </section>
+            ))}
+            {plannerGroupedSections.length === 0 ? <div className="empty-grid">No families match planner filters.</div> : null}
+          </div>
+
+          <div
+            className={`planner-dropzone ${dragOverDropzone ? 'drag-over' : ''}`}
+            onDragOver={(event) => {
+              event.preventDefault();
+              setDragOverDropzone(true);
+            }}
+            onDragLeave={() => setDragOverDropzone(false)}
+            onDrop={applyDropFamily}
+          >
+            <div className="planner-dropzone-head">
+              <div className="section-head">Loadout</div>
+              <div className="hint-text">Drag items from the library, or click tiles to add.</div>
+            </div>
+
+            {resolvedLoadout.length === 0 ? (
+              <div className="empty-panel planner-empty-dropzone">Drop items here to start planning.</div>
+            ) : (
+              <div className="planner-loadout-list">
+                {resolvedLoadout.map((row) => {
+                  const hasLevels = row.family.variants.some((variant) => variant.level !== undefined);
+                  return (
+                    <div key={row.entry.key} className="planner-loadout-row">
+                      <div className="planner-loadout-main">
+                        <div className="item-thumb planner-loadout-thumb">
+                          {row.variant.iconUrl ? (
+                            <LazyTileImage
+                              src={row.variant.iconUrl}
+                              alt={row.variant.name}
+                              isWeapon={isWeaponType(row.variant.type)}
+                            />
+                          ) : (
+                            <div className="tile-placeholder" aria-hidden />
+                          )}
+                        </div>
+                        <div>
+                          <div className="planner-loadout-name">{row.family.baseName}</div>
+                          <div className="hint-text">{row.variant.name}</div>
+                        </div>
+                      </div>
+                      <div className="planner-loadout-controls">
+                        {hasLevels ? (
+                          <select
+                            className="planner-select"
+                            value={row.variant.id}
+                            onChange={(event) => {
+                              const nextVariantId = event.target.value;
+                              setLoadoutEntries((previous) =>
+                                previous.map((entry) =>
+                                  entry.key === row.entry.key ? { ...entry, variantId: nextVariantId } : entry,
+                                ),
+                              );
+                            }}
+                          >
+                            {row.family.variants.map((variant) => (
+                              <option key={variant.id} value={variant.id}>
+                                {variantLabel(variant)}
+                              </option>
+                            ))}
+                          </select>
+                        ) : null}
+                        <div className="scope-toggle" role="group" aria-label="Craft mode">
+                          <button
+                            type="button"
+                            className={`scope-button ${row.entry.mode === 'upgrade' ? 'active' : ''}`}
+                            onClick={() =>
+                              setLoadoutEntries((previous) =>
+                                previous.map((entry) =>
+                                  entry.key === row.entry.key ? { ...entry, mode: 'upgrade' } : entry,
+                                ),
+                              )
+                            }
+                          >
+                            Upgrade
+                          </button>
+                          <button
+                            type="button"
+                            className={`scope-button ${row.entry.mode === 'craft' ? 'active' : ''}`}
+                            onClick={() =>
+                              setLoadoutEntries((previous) =>
+                                previous.map((entry) =>
+                                  entry.key === row.entry.key ? { ...entry, mode: 'craft' } : entry,
+                                ),
+                              )
+                            }
+                          >
+                            Craft
+                          </button>
+                        </div>
+                        <div className="planner-qty-control">
+                          <button
+                            type="button"
+                            className="scope-button"
+                            onClick={() =>
+                              setLoadoutEntries((previous) =>
+                                previous.map((entry) =>
+                                  entry.key === row.entry.key ? { ...entry, quantity: Math.max(1, entry.quantity - 1) } : entry,
+                                ),
+                              )
+                            }
+                          >
+                            -
+                          </button>
+                          <input
+                            className="planner-qty-input"
+                            type="number"
+                            min={1}
+                            value={row.entry.quantity}
+                            onChange={(event) => {
+                              const parsed = Number(event.target.value);
+                              const quantity = Number.isFinite(parsed) ? Math.max(1, Math.round(parsed)) : 1;
+                              setLoadoutEntries((previous) =>
+                                previous.map((entry) =>
+                                  entry.key === row.entry.key ? { ...entry, quantity } : entry,
+                                ),
+                              );
+                            }}
+                          />
+                          <button
+                            type="button"
+                            className="scope-button"
+                            onClick={() =>
+                              setLoadoutEntries((previous) =>
+                                previous.map((entry) =>
+                                  entry.key === row.entry.key ? { ...entry, quantity: entry.quantity + 1 } : entry,
+                                ),
+                              )
+                            }
+                          >
+                            +
+                          </button>
+                        </div>
+                        <button
+                          type="button"
+                          className="planner-remove"
+                          onClick={() => setLoadoutEntries((previous) => previous.filter((entry) => entry.key !== row.entry.key))}
+                          aria-label={`Remove ${row.family.baseName}`}
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    </div>
                   );
                 })}
               </div>
-            </section>
-          ))}
-          {groupedSections.length === 0 ? <div className="empty-grid">No families match filters.</div> : null}
-        </div>
-      </div>
+            )}
+          </div>
 
-      {selectedFamily ? <button type="button" className="panel-backdrop" onClick={closePanel} aria-label="Close details" /> : null}
-
-      <aside className={`side-panel ${selectedFamily ? 'open' : ''}`} aria-hidden={!selectedFamily}>
-        {selectedFamily ? (
-          <>
-            <div className="panel-head">
-              <div>
-                <div className="panel-title">{selectedFamily.baseName}</div>
-                <div className="panel-subtitle">{selectedVariant?.name ?? selectedFamily.baseName}</div>
-              </div>
-              <div className="panel-head-actions">
-                <button type="button" className="close-btn" onClick={closePanel}>
-                  Close
-                </button>
-              </div>
+          <aside className="planner-summary">
+            <div className="panel-section">
+              <div className="section-head">Direct Totals</div>
+              {directTotalViews.length > 0 ? (
+                <div className="panel-tile-grid">
+                  {directTotalViews.map((entry) => {
+                    const tileClass = tileClassForItem(entry.item?.type, entry.item?.rarity);
+                    return (
+                      <div key={`direct-${entry.requirement.key}`} className={`panel-item-tile item-tile ${tileClass}`}>
+                        <div className="item-thumb">
+                          {entry.item?.iconUrl ? (
+                            <LazyTileImage
+                              src={entry.item.iconUrl}
+                              alt={entry.requirement.name}
+                              isWeapon={isWeaponType(entry.item.type)}
+                            />
+                          ) : (
+                            <div className="tile-placeholder" aria-hidden />
+                          )}
+                        </div>
+                        <div className="tile-count">{formatAmount(entry.requirement.amount)}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="empty-panel">Add loadout items to compute direct materials.</div>
+              )}
             </div>
 
-            {showLevelSelector ? (
-              <div className="square-row">
-                {selectedFamily.variants.map((variant) => (
+            <div className="panel-section">
+              <div className="section-head">Base Totals</div>
+              {baseTotalViews.length > 0 ? (
+                <div className="panel-tile-grid">
+                  {baseTotalViews.map((entry) => {
+                    const tileClass = tileClassForItem(entry.item?.type, entry.item?.rarity);
+                    return (
+                      <div key={`base-${entry.requirement.key}`} className={`panel-item-tile item-tile ${tileClass}`}>
+                        <div className="item-thumb">
+                          {entry.item?.iconUrl ? (
+                            <LazyTileImage
+                              src={entry.item.iconUrl}
+                              alt={entry.requirement.name}
+                              isWeapon={isWeaponType(entry.item.type)}
+                            />
+                          ) : (
+                            <div className="tile-placeholder" aria-hidden />
+                          )}
+                        </div>
+                        <div className="tile-count">{formatAmount(entry.requirement.amount)}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="empty-panel">Base totals appear after direct requirements are available.</div>
+              )}
+            </div>
+
+            <div className="panel-section">
+              <div className="section-head-row">
+                <div className="section-head">Recycler Plan</div>
+                <div className="scope-toggle" role="group" aria-label="Recycler scope">
                   <button
-                    key={variant.id}
                     type="button"
-                    className={`mini-square ${variant.id === selectedVariant?.id ? 'selected' : ''}`}
-                    onClick={() => setSelectedVariantId(variant.id)}
+                    className={`scope-button ${plannerRecycleScope === 'materials' ? 'active' : ''}`}
+                    onClick={() => setPlannerRecycleScope('materials')}
                   >
-                    {variantLabel(variant)}
+                    Materials
                   </button>
-                ))}
-              </div>
-            ) : null}
-
-            {selectedVariant ? (
-              <div className="panel-section">
-                <div className="section-head">Item Info</div>
-                <div className="info-chip-row">
-                  {selectedVariant.type ? (
-                    <div className="info-chip">
-                      <span className="info-chip-label">Type</span>
-                      <span className="info-chip-value">{selectedVariant.type}</span>
-                    </div>
-                  ) : null}
-                  {selectedVariant.rarity ? (
-                    <div className="info-chip">
-                      <span className="info-chip-label">Rarity</span>
-                      <span className="info-chip-value">{selectedVariant.rarity}</span>
-                    </div>
-                  ) : null}
-                  {selectedVariant.value !== undefined ? (
-                    <div className="info-chip">
-                      <span className="info-chip-label">Value</span>
-                      <span className="info-chip-value">{formatAmount(selectedVariant.value)}</span>
-                    </div>
-                  ) : null}
-                  {selectedVariant.weight !== undefined ? (
-                    <div className="info-chip">
-                      <span className="info-chip-label">Weight</span>
-                      <span className="info-chip-value">{formatAmount(selectedVariant.weight)}</span>
-                    </div>
-                  ) : null}
+                  <button
+                    type="button"
+                    className={`scope-button ${plannerRecycleScope === 'withGear' ? 'active' : ''}`}
+                    onClick={() => setPlannerRecycleScope('withGear')}
+                  >
+                    + Gear
+                  </button>
                 </div>
               </div>
-            ) : null}
-
-            {hasRecycleInto || hasRecycleFrom ? (
-              <div className="panel-section">
-                <div className="section-head-row">
-                  <div className="section-head">Recycle Links</div>
-                  {hasRecycleInto && hasRecycleFrom ? (
-                    <div className="scope-toggle" role="group" aria-label="Recycle link mode">
-                      <button
-                        type="button"
-                        className={`scope-button ${recycleLinksMode === 'from' ? 'active' : ''}`}
-                        onClick={() => setRecycleLinksMode('from')}
-                      >
-                        From
-                      </button>
-                      <button
-                        type="button"
-                        className={`scope-button ${recycleLinksMode === 'into' ? 'active' : ''}`}
-                        onClick={() => setRecycleLinksMode('into')}
-                      >
-                        Into
-                      </button>
-                    </div>
-                  ) : null}
-                </div>
+              {recyclerPlan.length > 0 ? (
                 <div className="panel-tile-grid">
-                  {activeRecycleLinks.map((entry) => {
-                    const recycleClass = tileClassForItem(entry.type, entry.rarity);
-                    const selected = selectedRecycleLinkKey === entry.key;
-                    const dimmed = Boolean(selectedRecycleLinkKey) && !selected;
-                    return (
-                      <button
-                        key={`link-${entry.key}`}
-                        type="button"
-                        className={`panel-item-tile panel-item-tab item-tile ${recycleClass} ${selected ? 'selected' : ''} ${dimmed ? 'dimmed' : ''}`}
-                        onClick={() => {
-                          setFocusSelection(undefined);
-                          setSelectedRecycleLinkKey((previous) => (previous === entry.key ? undefined : entry.key));
-                        }}
-                        title={`${entry.name} x${formatAmount(entry.quantity)}`}
-                      >
-                        <div className="item-thumb">
-                          {entry.iconUrl ? (
-                            <img
-                              src={entry.iconUrl}
-                              alt={entry.name}
-                              loading="lazy"
-                              className={isWeaponType(entry.type) ? 'weapon-icon' : undefined}
-                            />
-                          ) : (
-                            <div className="tile-placeholder" aria-hidden />
-                          )}
-                        </div>
-                        <div className="tile-count">x{formatAmount(entry.quantity)}</div>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            ) : null}
-
-            {directRequirementViews.length > 0 ? (
-              <div className="panel-section">
-                <div className="section-head-row">
-                  <div className="section-head">Direct Materials</div>
-                  {showLevelSelector ? (
-                    <div className="scope-toggle" role="group" aria-label="Direct material mode">
-                      <button
-                        type="button"
-                        className={`scope-button ${directMode === 'upgrade' ? 'active' : ''}`}
-                        onClick={() => setDirectMode('upgrade')}
-                      >
-                        Upgrade
-                      </button>
-                      <button
-                        type="button"
-                        className={`scope-button ${directMode === 'craft' ? 'active' : ''}`}
-                        onClick={() => setDirectMode('craft')}
-                      >
-                        Craft
-                      </button>
-                    </div>
-                  ) : null}
-                </div>
-                <div className="panel-tile-grid">
-                  {directRequirementViews.map((entry) => {
-                    const requirementClass = tileClassForItem(entry.requirementItem?.type, entry.requirementItem?.rarity);
-                    const selected = focusedDirectKeys?.has(entry.requirement.key) ?? false;
-                    const dimmed = hasFocus && !selected;
-                    return (
-                      <button
-                        key={entry.requirement.key}
-                        type="button"
-                        className={`panel-item-tile panel-item-tab item-tile ${requirementClass} ${selected ? 'selected' : ''} ${dimmed ? 'dimmed' : ''}`}
-                        onClick={() => {
-                          setSelectedRecycleLinkKey(undefined);
-                          toggleFocus('direct', entry.requirement.key);
-                        }}
-                        title={`${entry.requirement.name}: ${formatAmount(entry.requirement.amount)}`}
-                      >
-                        <div className="item-thumb">
-                          {entry.requirementItem?.iconUrl ? (
-                            <img
-                              src={entry.requirementItem.iconUrl}
-                              alt={entry.requirement.name}
-                              loading="lazy"
-                              className={isWeaponType(entry.requirementItem.type) ? 'weapon-icon' : undefined}
-                            />
-                          ) : (
-                            <div className="tile-placeholder" aria-hidden />
-                          )}
-                        </div>
-                        <div className="tile-count">{formatAmount(entry.requirement.amount)}</div>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            ) : null}
-
-            {drilledRequirementViews.length > 0 ? (
-              <div className="panel-section">
-                <div className="section-head">Base Materials</div>
-                <div className="panel-tile-grid">
-                  {drilledRequirementViews.map((entry) => {
-                    const drilledClass = tileClassForItem(entry.requirementItem?.type, entry.requirementItem?.rarity);
-                    const selected = focusedMaterialKeys?.has(entry.requirement.key) ?? false;
-                    const dimmed = hasFocus && !selected;
-                    return (
-                      <button
-                        key={`drill-${entry.requirement.key}`}
-                        type="button"
-                        className={`panel-item-tile panel-item-tab item-tile ${drilledClass} ${selected ? 'selected' : ''} ${dimmed ? 'dimmed' : ''}`}
-                        onClick={() => {
-                          setSelectedRecycleLinkKey(undefined);
-                          toggleFocus('material', entry.requirement.key);
-                        }}
-                        title={`${entry.requirement.name}: ${formatAmount(entry.requirement.amount)}`}
-                      >
-                        <div className="item-thumb">
-                          {entry.requirementItem?.iconUrl ? (
-                            <img
-                              src={entry.requirementItem.iconUrl}
-                              alt={entry.requirement.name}
-                              loading="lazy"
-                              className={isWeaponType(entry.requirementItem.type) ? 'weapon-icon' : undefined}
-                            />
-                          ) : (
-                            <div className="tile-placeholder" aria-hidden />
-                          )}
-                        </div>
-                        <div className="tile-count">{formatAmount(entry.requirement.amount)}</div>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            ) : null}
-
-            {allRecycleViews.length > 0 ? (
-              <div className="panel-section">
-                <div className="section-head-row">
-                  <div className="section-head">Recyclables</div>
-                  <div className="scope-toggle" role="group" aria-label="Recyclable scope">
-                    <button
-                      type="button"
-                      className={`scope-button ${recycleScope === 'materials' ? 'active' : ''}`}
-                      onClick={() => setRecycleScope('materials')}
-                    >
-                      Materials
-                    </button>
-                    <button
-                      type="button"
-                      className={`scope-button ${recycleScope === 'withGear' ? 'active' : ''}`}
-                      onClick={() => setRecycleScope('withGear')}
-                    >
-                      + Gear
-                    </button>
-                  </div>
-                </div>
-                <div className="panel-tile-grid">
-                  {allRecycleViews.map((entry) => {
+                  {recyclerPlan.map((entry) => {
                     const recycleItem = itemById.get(entry.itemId);
-                    const recycleClass = tileClassForItem(recycleItem?.type ?? entry.itemType, recycleItem?.rarity);
-                    const selected = focusedRecyclerIds?.has(entry.itemId) ?? false;
-                    const dimmed = hasFocus && !selected;
+                    const tileClass = tileClassForItem(recycleItem?.type ?? entry.itemType, recycleItem?.rarity);
                     return (
-                      <button
-                        key={entry.itemId}
-                        type="button"
-                        className={`panel-item-tile panel-item-tab item-tile ${recycleClass} ${selected ? 'selected' : ''} ${dimmed ? 'dimmed' : ''}`}
-                        onClick={() => {
-                          setSelectedRecycleLinkKey(undefined);
-                          toggleFocus('recycler', entry.itemId);
-                        }}
-                        title={`${entry.itemName} x${entry.recycleCount}`}
-                      >
+                      <div key={`recycler-${entry.itemId}`} className={`panel-item-tile item-tile ${tileClass}`} title={entry.covers.join(', ')}>
                         <div className="item-thumb">
                           {recycleItem?.iconUrl ? (
-                            <img
+                            <LazyTileImage
                               src={recycleItem.iconUrl}
                               alt={entry.itemName}
-                              loading="lazy"
-                              className={isWeaponType(recycleItem?.type ?? entry.itemType) ? 'weapon-icon' : undefined}
+                              isWeapon={isWeaponType(recycleItem.type)}
                             />
                           ) : (
                             <div className="tile-placeholder" aria-hidden />
                           )}
                         </div>
                         <div className="tile-count">x{entry.recycleCount}</div>
-                      </button>
+                      </div>
                     );
                   })}
                 </div>
-              </div>
-            ) : null}
-
-          </>
-        ) : null}
-      </aside>
+              ) : (
+                <div className="empty-panel">Recycler recommendations will appear here.</div>
+              )}
+            </div>
+          </aside>
+        </div>
+      )}
     </div>
   );
 }
